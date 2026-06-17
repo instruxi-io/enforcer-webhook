@@ -13,11 +13,18 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 )
+
+// ErrUnknownTenant tells the ingress to reject a webhook as unauthorized (401):
+// the tenant has no configured signing key. Any OTHER error a KeyResolver
+// returns is treated as transient — the ingress answers 503 so the provider
+// retries rather than dead-lettering when the secret store is briefly down.
+var ErrUnknownTenant = errors.New("unknown or unconfigured tenant")
 
 // Defaults: webhook bodies are tiny; anything larger is almost certainly an
 // attack or misconfiguration. Payloads older than the skew are rejected.
@@ -63,8 +70,10 @@ type Extractor func(body []byte) (Event, error)
 
 // KeyResolver returns the HMAC signing key for a tenant (central, multi-tenant
 // ingress reads the tenant from the URL and looks up its per-tenant secret).
-// ok=false rejects the request as an unknown/unconfigured tenant.
-type KeyResolver func(tenantID string) (signingKey string, ok bool)
+// A nil error with a non-empty key authorizes verification. Return
+// ErrUnknownTenant to reject (401); any other error is treated as transient
+// and answered 503 so the provider retries.
+type KeyResolver func(tenantID string) (signingKey string, err error)
 
 // Verifier validates a request's signature against the resolved key. When set,
 // it replaces the default HMAC-SHA256-of-body check, letting providers with
@@ -151,9 +160,18 @@ func (h *IngestHandler) handle(c *fiber.Ctx) error {
 		if tenant == "" {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing_tenant"})
 		}
-		key, ok := h.cfg.KeyResolver(tenant)
-		if !ok {
+		key, err := h.cfg.KeyResolver(tenant)
+		switch {
+		case errors.Is(err, ErrUnknownTenant):
 			h.warnw("webhook for unknown/unconfigured tenant", "tenant_id", tenant)
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown_tenant"})
+		case err != nil:
+			// Transient (secret store down): 503 so the provider retries rather
+			// than dead-lettering an otherwise-valid webhook.
+			h.errorw("webhook secret resolver unavailable; asking for retry", "tenant_id", tenant, "err", err)
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "resolver_unavailable"})
+		case key == "":
+			h.warnw("webhook resolver returned empty key", "tenant_id", tenant)
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown_tenant"})
 		}
 		signingKey = key

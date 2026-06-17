@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -106,9 +107,12 @@ func multiTenantCfg(keys map[string]string) Config {
 	cfg := baseCfg()
 	cfg.Route = "/webhooks/cdp/:tenant_id/routed"
 	cfg.IngestTenant = "" // ignored in multi-tenant mode
-	cfg.KeyResolver = func(tid string) (string, bool) {
+	cfg.KeyResolver = func(tid string) (string, error) {
 		k, ok := keys[tid]
-		return k, ok
+		if !ok {
+			return "", ErrUnknownTenant
+		}
+		return k, nil
 	}
 	return cfg
 }
@@ -131,6 +135,21 @@ func TestIngestMultiTenantRejectsUnknownTenant(t *testing.T) {
 	rec, _ := doPath(t, h, "/webhooks/cdp/:tenant_id/routed", "/webhooks/cdp/ghost/routed",
 		sign([]byte(body), "acme-secret"), body)
 	assert.Equal(t, fiber.StatusUnauthorized, rec.Code)
+	assert.Zero(t, pub.calls)
+}
+
+func TestIngestMultiTenantTransientResolverIs503(t *testing.T) {
+	// A transient resolver error (secret store down) must be 503 so the
+	// provider retries — not 401, which would dead-letter a valid webhook.
+	pub := &capturePub{}
+	cfg := baseCfg()
+	cfg.Route = "/webhooks/cdp/:tenant_id/routed"
+	cfg.KeyResolver = func(string) (string, error) { return "", errors.New("v3 unreachable") }
+	h := NewIngestHandler(pub, cfg)
+	body := `{"guid":"e","event_type":"x"}`
+	rec, _ := doPath(t, h, "/webhooks/cdp/:tenant_id/routed", "/webhooks/cdp/acme/routed",
+		sign([]byte(body), "whatever"), body)
+	assert.Equal(t, fiber.StatusServiceUnavailable, rec.Code)
 	assert.Zero(t, pub.calls)
 }
 
