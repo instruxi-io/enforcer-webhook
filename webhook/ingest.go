@@ -61,18 +61,30 @@ type Event struct {
 // Extractor pulls the Event fields from a provider's raw body.
 type Extractor func(body []byte) (Event, error)
 
+// KeyResolver returns the HMAC signing key for a tenant (central, multi-tenant
+// ingress reads the tenant from the URL and looks up its per-tenant secret).
+// ok=false rejects the request as an unknown/unconfigured tenant.
+type KeyResolver func(tenantID string) (signingKey string, ok bool)
+
 // Config is the provider-specific ingress configuration.
 type Config struct {
-	Route           string // mount path, e.g. "/webhooks/cybrid"
+	Route           string // mount path, e.g. "/webhooks/cybrid" or "/webhooks/cdp/:tenant_id/routed"
 	SignatureHeader string // e.g. "X-Cybrid-Signature"
-	SigningKey      string // HMAC-SHA256 key; empty + !AllowUnsigned = fail closed
+	SigningKey      string // single-tenant HMAC key; empty + !AllowUnsigned = fail closed
 	AllowUnsigned   bool   // local/mock only; production must leave false
 	RawTopic        string // topic the raw payload is published to
-	IngestTenant    string // sentinel tenant for instance-global ingest
+	IngestTenant    string // single-tenant: sentinel tenant stamped on the publish
 	ServiceUser     string // service principal recorded on the publish
 	Extract         Extractor
 	MaxBodySize     int           // 0 => DefaultMaxBodySize
 	MaxClockSkew    time.Duration // 0 => DefaultMaxClockSkew
+
+	// Multi-tenant (central ingress): when KeyResolver is set, the tenant is
+	// read from the URL path param TenantParam, its signing key resolved per
+	// request, and the published event is stamped with that tenant (IngestTenant
+	// is ignored). The Route must contain :<TenantParam>.
+	KeyResolver KeyResolver
+	TenantParam string // path param name; "" => "tenant_id"
 }
 
 // IngestHandler receives provider webhooks and forwards them to the bus.
@@ -103,21 +115,46 @@ func (h *IngestHandler) WithMetrics(m Metrics) *IngestHandler { h.metrics = m; r
 // Register mounts the (unauthenticated, signature-verified) webhook route.
 func (h *IngestHandler) Register(r fiber.Router) { r.Post(h.cfg.Route, h.handle) }
 
+func (h *IngestHandler) tenantParam() string {
+	if h.cfg.TenantParam != "" {
+		return h.cfg.TenantParam
+	}
+	return "tenant_id"
+}
+
 func (h *IngestHandler) handle(c *fiber.Ctx) error {
 	body := c.Body()
 	if len(body) > h.cfg.MaxBodySize {
 		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "payload_too_large"})
 	}
 
+	// Resolve the publish tenant + signing key. Central (multi-tenant) ingress
+	// reads the tenant from the URL and looks up its per-tenant key; single-
+	// tenant ingress uses the static key + sentinel tenant.
+	tenant := h.cfg.IngestTenant
+	signingKey := h.cfg.SigningKey
+	if h.cfg.KeyResolver != nil {
+		tenant = c.Params(h.tenantParam())
+		if tenant == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing_tenant"})
+		}
+		key, ok := h.cfg.KeyResolver(tenant)
+		if !ok {
+			h.warnw("webhook for unknown/unconfigured tenant", "tenant_id", tenant)
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown_tenant"})
+		}
+		signingKey = key
+	}
+
 	// HMAC-SHA256 signature. Fails closed: with no key configured we reject
 	// unless AllowUnsigned (local/mock) is set.
 	signature := c.Get(h.cfg.SignatureHeader)
 	if !h.cfg.AllowUnsigned {
-		if h.cfg.SigningKey == "" {
-			h.errorw("SECURITY: webhook signing key not configured - rejecting")
+		if signingKey == "" {
+			h.errorw("SECURITY: webhook signing key not configured - rejecting", "tenant_id", tenant)
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid_signature"})
 		}
-		if !ValidSignature(signature, body, h.cfg.SigningKey) {
+		if !ValidSignature(signature, body, signingKey) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid_signature"})
 		}
 	}
@@ -152,7 +189,7 @@ func (h *IngestHandler) handle(c *fiber.Ctx) error {
 	if signature != "" {
 		headers["x-webhook-signature"] = signature // carried for audit/replay fidelity
 	}
-	if err := h.pub.Publish(c.Context(), h.cfg.IngestTenant, h.cfg.ServiceUser, h.cfg.RawTopic, ev.ID, string(body), headers); err != nil {
+	if err := h.pub.Publish(c.Context(), tenant, h.cfg.ServiceUser, h.cfg.RawTopic, ev.ID, string(body), headers); err != nil {
 		// 500 so the provider retries; we must not drop a webhook.
 		h.errorw("failed to publish raw webhook", "event_id", ev.ID, "err", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "publish_failed"})
