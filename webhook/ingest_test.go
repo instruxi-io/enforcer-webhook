@@ -18,6 +18,7 @@ import (
 
 type capturePub struct {
 	calls   int
+	tenant  string
 	topic   string
 	key     string
 	value   string
@@ -25,9 +26,9 @@ type capturePub struct {
 	err     error
 }
 
-func (p *capturePub) Publish(_ context.Context, _, _, topic, key, value string, headers map[string]string) error {
+func (p *capturePub) Publish(_ context.Context, tenant, _, topic, key, value string, headers map[string]string) error {
 	p.calls++
-	p.topic, p.key, p.value, p.headers = topic, key, value, headers
+	p.tenant, p.topic, p.key, p.value, p.headers = tenant, topic, key, value, headers
 	return p.err
 }
 
@@ -83,6 +84,65 @@ func TestIngestValidSignaturePublishes(t *testing.T) {
 	assert.Equal(t, "test.webhook.raw", pub.topic)
 	assert.Equal(t, "evt-1", pub.key)
 	assert.Equal(t, "account.created", pub.headers["event_type"])
+}
+
+// doPath drives a multi-tenant route whose path carries :tenant_id.
+func doPath(t *testing.T, h *IngestHandler, route, url, sig, body string) (*httptest.ResponseRecorder, *fiber.Ctx) {
+	t.Helper()
+	app := fiber.New()
+	app.Post(route, h.handle)
+	req := httptest.NewRequest("POST", url, strings.NewReader(body))
+	if sig != "" {
+		req.Header.Set("X-Sig", sig)
+	}
+	res, err := app.Test(req, -1)
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	rec.Code = res.StatusCode
+	return rec, nil
+}
+
+func multiTenantCfg(keys map[string]string) Config {
+	cfg := baseCfg()
+	cfg.Route = "/webhooks/cdp/:tenant_id/routed"
+	cfg.IngestTenant = "" // ignored in multi-tenant mode
+	cfg.KeyResolver = func(tid string) (string, bool) {
+		k, ok := keys[tid]
+		return k, ok
+	}
+	return cfg
+}
+
+func TestIngestMultiTenantResolvesKeyAndStampsTenant(t *testing.T) {
+	pub := &capturePub{}
+	h := NewIngestHandler(pub, multiTenantCfg(map[string]string{"acme": "acme-secret"}))
+	body := `{"guid":"evt-7","event_type":"router.routed"}`
+	rec, _ := doPath(t, h, "/webhooks/cdp/:tenant_id/routed", "/webhooks/cdp/acme/routed",
+		sign([]byte(body), "acme-secret"), body)
+	assert.Equal(t, fiber.StatusOK, rec.Code)
+	require.Equal(t, 1, pub.calls)
+	assert.Equal(t, "acme", pub.tenant, "publish is stamped with the URL tenant")
+}
+
+func TestIngestMultiTenantRejectsUnknownTenant(t *testing.T) {
+	pub := &capturePub{}
+	h := NewIngestHandler(pub, multiTenantCfg(map[string]string{"acme": "acme-secret"}))
+	body := `{"guid":"e","event_type":"x"}`
+	rec, _ := doPath(t, h, "/webhooks/cdp/:tenant_id/routed", "/webhooks/cdp/ghost/routed",
+		sign([]byte(body), "acme-secret"), body)
+	assert.Equal(t, fiber.StatusUnauthorized, rec.Code)
+	assert.Zero(t, pub.calls)
+}
+
+func TestIngestMultiTenantUsesPerTenantKey(t *testing.T) {
+	// A signature valid for tenant A must not be accepted on tenant B's path.
+	pub := &capturePub{}
+	h := NewIngestHandler(pub, multiTenantCfg(map[string]string{"a": "key-a", "b": "key-b"}))
+	body := `{"guid":"e","event_type":"x"}`
+	rec, _ := doPath(t, h, "/webhooks/cdp/:tenant_id/routed", "/webhooks/cdp/b/routed",
+		sign([]byte(body), "key-a"), body)
+	assert.Equal(t, fiber.StatusUnauthorized, rec.Code)
+	assert.Zero(t, pub.calls)
 }
 
 func TestIngestRejectsBadSignature(t *testing.T) {
