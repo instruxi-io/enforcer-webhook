@@ -145,6 +145,53 @@ func TestIngestMultiTenantUsesPerTenantKey(t *testing.T) {
 	assert.Zero(t, pub.calls)
 }
 
+func TestIngestCustomVerifierReplacesDefault(t *testing.T) {
+	// A custom verifier accepts on a provider-specific header the default
+	// HMAC-of-body check would never pass.
+	pub := &capturePub{}
+	cfg := baseCfg()
+	cfg.SignatureHeader = "X-Hook0-Signature"
+	cfg.Verifier = func(c *fiber.Ctx, body []byte, key string) bool {
+		return c.Get("X-Hook0-Signature") == "scheme-ok" && key == "secret"
+	}
+	h := NewIngestHandler(pub, cfg)
+
+	app := fiber.New()
+	h.Register(app)
+	body := `{"guid":"evt-9","event_type":"router.routed"}`
+	req := httptest.NewRequest("POST", "/webhooks/test", strings.NewReader(body))
+	req.Header.Set("X-Hook0-Signature", "scheme-ok")
+	res, err := app.Test(req, -1)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, res.StatusCode)
+	require.Equal(t, 1, pub.calls)
+
+	// Same handler, wrong scheme value -> rejected, not published.
+	pub2 := &capturePub{}
+	cfg.Verifier = func(c *fiber.Ctx, body []byte, key string) bool { return false }
+	h2 := NewIngestHandler(pub2, cfg)
+	app2 := fiber.New()
+	h2.Register(app2)
+	req2 := httptest.NewRequest("POST", "/webhooks/test", strings.NewReader(body))
+	req2.Header.Set("X-Hook0-Signature", "scheme-ok")
+	res2, err := app2.Test(req2, -1)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusUnauthorized, res2.StatusCode)
+	assert.Zero(t, pub2.calls)
+}
+
+func TestIngestCustomVerifierStillFailsClosedWithoutKey(t *testing.T) {
+	// Verifier must not run when no key is configured (fail-closed guard).
+	called := false
+	cfg := baseCfg()
+	cfg.SigningKey = ""
+	cfg.Verifier = func(c *fiber.Ctx, body []byte, key string) bool { called = true; return true }
+	h := NewIngestHandler(&capturePub{}, cfg)
+	rec := do(t, h, "", `{"guid":"e","event_type":"x"}`)
+	assert.Equal(t, fiber.StatusUnauthorized, rec.Code)
+	assert.False(t, called, "verifier must not run without a configured key")
+}
+
 func TestIngestRejectsBadSignature(t *testing.T) {
 	pub := &capturePub{}
 	h := NewIngestHandler(pub, baseCfg())
