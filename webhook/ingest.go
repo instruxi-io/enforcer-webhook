@@ -66,6 +66,14 @@ type Extractor func(body []byte) (Event, error)
 // ok=false rejects the request as an unknown/unconfigured tenant.
 type KeyResolver func(tenantID string) (signingKey string, ok bool)
 
+// Verifier validates a request's signature against the resolved key. When set,
+// it replaces the default HMAC-SHA256-of-body check, letting providers with
+// non-trivial schemes (Coinbase/Hook0's "t=…,h=…,v1=…", Stripe, svix) plug in.
+// It receives the full Ctx so it can read whichever headers the provider signs.
+// Return false to reject (the handler answers 401). The fail-closed empty-key
+// guard still runs before this is called.
+type Verifier func(c *fiber.Ctx, body []byte, key string) bool
+
 // Config is the provider-specific ingress configuration.
 type Config struct {
 	Route           string // mount path, e.g. "/webhooks/cybrid" or "/webhooks/cdp/:tenant_id/routed"
@@ -78,6 +86,11 @@ type Config struct {
 	Extract         Extractor
 	MaxBodySize     int           // 0 => DefaultMaxBodySize
 	MaxClockSkew    time.Duration // 0 => DefaultMaxClockSkew
+
+	// Verifier overrides the default HMAC-SHA256-of-body signature check for
+	// providers with custom signing schemes. nil => default check on
+	// SignatureHeader. The fail-closed empty-key guard runs regardless.
+	Verifier Verifier
 
 	// Multi-tenant (central ingress): when KeyResolver is set, the tenant is
 	// read from the URL path param TenantParam, its signing key resolved per
@@ -146,15 +159,20 @@ func (h *IngestHandler) handle(c *fiber.Ctx) error {
 		signingKey = key
 	}
 
-	// HMAC-SHA256 signature. Fails closed: with no key configured we reject
-	// unless AllowUnsigned (local/mock) is set.
+	// Signature check. Fails closed: with no key configured we reject unless
+	// AllowUnsigned (local/mock) is set. A custom Verifier (e.g. Hook0's
+	// t=,h=,v1= scheme) replaces the default HMAC-SHA256-of-body check.
 	signature := c.Get(h.cfg.SignatureHeader)
 	if !h.cfg.AllowUnsigned {
 		if signingKey == "" {
 			h.errorw("SECURITY: webhook signing key not configured - rejecting", "tenant_id", tenant)
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid_signature"})
 		}
-		if !ValidSignature(signature, body, signingKey) {
+		valid := ValidSignature(signature, body, signingKey)
+		if h.cfg.Verifier != nil {
+			valid = h.cfg.Verifier(c, body, signingKey)
+		}
+		if !valid {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid_signature"})
 		}
 	}
