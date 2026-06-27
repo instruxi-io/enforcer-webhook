@@ -1,4 +1,4 @@
-module github.com/instruxi-io/platform
+module github.com/instruxi-io/enforcer-webhook
 
 go 1.25.7
 

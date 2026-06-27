@@ -1,7 +1,7 @@
-# platform
+# enforcer-webhook
 
-Shared Go library for the enforcer microservices (`github.com/instruxi-io/platform`),
-consumed via a go.mod `replace` like `protos`.
+Shared Go library for the enforcer microservices (`github.com/instruxi-io/enforcer-webhook`),
+consumed via a versioned go.mod `require`.
 
 ## Packages
 
