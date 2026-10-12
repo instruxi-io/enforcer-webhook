@@ -30,3 +30,19 @@ h := webhook.NewIngestHandler(mbClient, webhook.Config{
 }).WithDeduper(kvDedupe).WithLogger(sugar).WithMetrics(m)
 h.Register(app)
 ```
+
+## `outbound` — signed deliveries to customer URLs
+
+Package `github.com/instruxi-io/enforcer-webhook/outbound` is the sending side.
+
+- `Sign` / `SignMulti` — header `t=<unix>,v1=<hex HMAC-SHA256(secret, "<unix>." + body)>`;
+  `SignMulti` emits one `v1=` per secret for rotation.
+- `Verify(header, body, secrets, tolerance, now)` — constant-time; any `v1` against
+  any secret; `ErrMalformed`, `ErrStale`, `ErrNoMatch`. Use `DefaultTolerance` (5m).
+- `NewClient(Options)` — no redirects, 10s default timeout, and the destination IP is
+  checked in the dialer's `Control` hook after DNS resolution (blocks loopback, RFC1918,
+  link-local/metadata, CGNAT, reserved, multicast, ULA, and IPv4 hidden in IPv6).
+  `AllowPrivate` is for tests only.
+- `ValidateURL` — registration-time check: https, host, no userinfo, port 443, no blocked
+  IP literal, no `localhost`/`*.local`/`*.internal`/`*.svc`/`*.cluster.local`.
+- `testdata/vector.json` — fixed vector that other implementations (merchant SDK) must reproduce.
