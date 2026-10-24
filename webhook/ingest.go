@@ -79,6 +79,9 @@ type KeyResolver func(tenantID string) (signingKey string, err error)
 // it replaces the default HMAC-SHA256-of-body check, letting providers with
 // non-trivial schemes (Coinbase/Hook0's "t=…,h=…,v1=…", Stripe, svix) plug in.
 // It receives the full Ctx so it can read whichever headers the provider signs.
+// body is the RAW request bytes exactly as received (still compressed if the
+// sender set Content-Encoding); a Verifier must check those and must not call
+// c.Body(), which would decode an unauthenticated body.
 // Return false to reject (the handler answers 401). The fail-closed empty-key
 // guard still runs before this is called.
 type Verifier func(c *fiber.Ctx, body []byte, key string) bool
@@ -145,10 +148,23 @@ func (h *IngestHandler) tenantParam() string {
 }
 
 func (h *IngestHandler) handle(c *fiber.Ctx) error {
-	body := c.Body()
-	if len(body) > h.cfg.MaxBodySize {
+	// The RAW wire bytes, never c.Body(). Fiber's c.Body() decompresses
+	// according to Content-Encoding (gzip/deflate/br) with no size cap the
+	// moment it is called, so calling it here put the Brotli decoder
+	// (CVE-2026-111497) and unbounded decompression in front of an anonymous
+	// caller, before the signature check. Every provider we ingest (Cybrid,
+	// Telnyx, Privy/svix, Coinbase/Hook0) signs the exact bytes it sends, so
+	// the signature is verified over these bytes, and only a verified body is
+	// ever decoded (see DecodeBody below).
+	raw := c.Request().Body()
+	if len(raw) > h.cfg.MaxBodySize {
 		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "payload_too_large"})
 	}
+	// Take Content-Encoding off the request so nothing downstream of this point
+	// (a custom Verifier, an Extractor) can trigger fiber's implicit decode by
+	// calling c.Body() itself. string() copies: the header buffer is reused.
+	contentEncoding := string(c.Request().Header.Peek(fiber.HeaderContentEncoding))
+	c.Request().Header.Del(fiber.HeaderContentEncoding)
 
 	// Resolve the publish tenant + signing key. Central (multi-tenant) ingress
 	// reads the tenant from the URL and looks up its per-tenant key; single-
@@ -186,13 +202,28 @@ func (h *IngestHandler) handle(c *fiber.Ctx) error {
 			h.errorw("SECURITY: webhook signing key not configured - rejecting", "tenant_id", tenant)
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid_signature"})
 		}
-		valid := ValidSignature(signature, body, signingKey)
+		valid := ValidSignature(signature, raw, signingKey)
 		if h.cfg.Verifier != nil {
-			valid = h.cfg.Verifier(c, body, signingKey)
+			valid = h.cfg.Verifier(c, raw, signingKey)
 		}
 		if !valid {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid_signature"})
 		}
+	}
+
+	// Only now, with the sender authenticated, undo any Content-Encoding —
+	// capped at MaxBodySize decompressed, and a bad stream is a 4xx, not a
+	// panic. No provider we ingest compresses today; this keeps the behaviour
+	// fiber's auto-decode used to give (Extract and the bus see plaintext).
+	body, err := DecodeBody(contentEncoding, raw, h.cfg.MaxBodySize)
+	switch {
+	case errors.Is(err, ErrDecodedTooLarge):
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "payload_too_large"})
+	case errors.Is(err, ErrUnsupportedEncoding):
+		return c.Status(fiber.StatusUnsupportedMediaType).JSON(fiber.Map{"error": "unsupported_content_encoding"})
+	case err != nil:
+		h.warnw("webhook body failed to decode", "tenant_id", tenant, "content_encoding", contentEncoding, "err", err)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_payload"})
 	}
 
 	ev, err := h.cfg.Extract(body)

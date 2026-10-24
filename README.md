@@ -14,6 +14,9 @@ re-implementing the security-sensitive core:
   limits, idempotency (`Deduper`), and publishing the raw payload to a topic via a
   `Publisher`. Provider specifics (signature header, how to read the event id/type
   from the body via an `Extractor`, the topic/route) come from `Config`.
+  The signature is checked over the raw wire bytes; a `Content-Encoding` body is
+  decoded only after that, by `DecodeBody`, capped at `MaxBodySize` decompressed
+  (CVE-2026-111497: never call fiber's `c.Body()` before verifying).
 - `Store` + `Entry` + `Replay` — dead-letter persistence interface + re-publish helper.
 
 enforcer-mb stays a pure bus; this is the edge. See the enforcer-v3
