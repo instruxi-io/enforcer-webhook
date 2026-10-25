@@ -3,12 +3,12 @@ module github.com/instruxi-io/enforcer-webhook
 go 1.25.7
 
 require (
+	github.com/andybalholm/brotli v1.2.7
 	github.com/gofiber/fiber/v2 v2.52.13
 	github.com/stretchr/testify v1.11.1
 )
 
 require (
-	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
