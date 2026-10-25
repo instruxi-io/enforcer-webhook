@@ -42,6 +42,12 @@ type Publisher interface {
 // the first time, false on duplicates (replay protection). nil disables dedupe.
 type Deduper func(ctx context.Context, eventID string) (firstSeen bool, err error)
 
+// DedupeReleaser forgets an event id the Deduper just recorded. The handler
+// calls it when the publish of a first-seen event fails: the 500 asks the
+// provider to retry, and without the release that retry would be acked as a
+// duplicate and the event lost. nil keeps the mark (the old behaviour).
+type DedupeReleaser func(ctx context.Context, eventID string) error
+
 // Logger is the minimal structured-logging surface (zap.SugaredLogger satisfies
 // it directly; slog adapts trivially). nil disables logging.
 type Logger interface {
@@ -117,6 +123,7 @@ type IngestHandler struct {
 	cfg     Config
 	pub     Publisher
 	dedupe  Deduper
+	release DedupeReleaser
 	log     Logger
 	metrics Metrics
 }
@@ -134,8 +141,12 @@ func NewIngestHandler(pub Publisher, cfg Config) *IngestHandler {
 }
 
 func (h *IngestHandler) WithDeduper(d Deduper) *IngestHandler { h.dedupe = d; return h }
-func (h *IngestHandler) WithLogger(l Logger) *IngestHandler   { h.log = l; return h }
-func (h *IngestHandler) WithMetrics(m Metrics) *IngestHandler { h.metrics = m; return h }
+
+// WithDedupeRelease sets the hook that undoes a dedupe mark when the publish
+// it guarded fails (see DedupeReleaser).
+func (h *IngestHandler) WithDedupeRelease(r DedupeReleaser) *IngestHandler { h.release = r; return h }
+func (h *IngestHandler) WithLogger(l Logger) *IngestHandler                { h.log = l; return h }
+func (h *IngestHandler) WithMetrics(m Metrics) *IngestHandler              { h.metrics = m; return h }
 
 // Register mounts the (unauthenticated, signature-verified) webhook route.
 func (h *IngestHandler) Register(r fiber.Router) { r.Post(h.cfg.Route, h.handle) }
@@ -241,8 +252,10 @@ func (h *IngestHandler) handle(c *fiber.Ctx) error {
 
 	// Replay protection: first delivery wins; duplicates are acked (200) but not
 	// re-published. Fails open to availability.
+	marked := false
 	if h.dedupe != nil {
 		firstSeen, derr := h.dedupe(c.Context(), ev.ID)
+		marked = derr == nil && firstSeen
 		if derr != nil {
 			h.warnw("dedupe check failed; processing anyway", "event_id", ev.ID, "err", derr)
 		} else if !firstSeen {
@@ -257,8 +270,14 @@ func (h *IngestHandler) handle(c *fiber.Ctx) error {
 		headers["x-webhook-signature"] = signature // carried for audit/replay fidelity
 	}
 	if err := h.pub.Publish(c.Context(), tenant, h.cfg.ServiceUser, h.cfg.RawTopic, ev.ID, string(body), headers); err != nil {
-		// 500 so the provider retries; we must not drop a webhook.
+		// 500 so the provider retries; we must not drop a webhook. Release the
+		// mark this delivery set, or the retry is acked as a duplicate.
 		h.errorw("failed to publish raw webhook", "event_id", ev.ID, "err", err)
+		if marked && h.release != nil {
+			if rerr := h.release(c.Context(), ev.ID); rerr != nil {
+				h.errorw("failed to release dedupe mark; the retry will be dropped as a duplicate", "event_id", ev.ID, "err", rerr)
+			}
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "publish_failed"})
 	}
 	resource, _, _ := strings.Cut(ev.Type, ".")

@@ -296,3 +296,43 @@ func TestReplayRepublishes(t *testing.T) {
 	assert.Equal(t, "evt-9", pub.key)
 	assert.Equal(t, "true", pub.headers["x-webhook-replay"])
 }
+
+// dedupeStore is a SetNX-style deduper with a release hook, as cybrid wires it.
+type dedupeStore struct{ seen map[string]bool }
+
+func (d *dedupeStore) dedupe(_ context.Context, id string) (bool, error) {
+	if d.seen[id] {
+		return false, nil
+	}
+	d.seen[id] = true
+	return true, nil
+}
+func (d *dedupeStore) release(_ context.Context, id string) error { delete(d.seen, id); return nil }
+
+func TestIngestPublishFailureReleasesDedupeSoRetryPublishes(t *testing.T) {
+	pub := &capturePub{err: errors.New("bus down")}
+	st := &dedupeStore{seen: map[string]bool{}}
+	h := NewIngestHandler(pub, baseCfg()).WithDeduper(st.dedupe).WithDedupeRelease(st.release)
+	body := `{"guid":"evt-1","event_type":"transfer.completed"}`
+	s := sign([]byte(body), "secret")
+
+	assert.Equal(t, fiber.StatusInternalServerError, do(t, h, s, body).Code, "a failed publish asks the provider to retry")
+	pub.err = nil
+	assert.Equal(t, fiber.StatusOK, do(t, h, s, body).Code)
+	assert.Equal(t, 2, pub.calls, "the retry is published, not acked as a duplicate")
+	assert.Equal(t, fiber.StatusOK, do(t, h, s, body).Code)
+	assert.Equal(t, 2, pub.calls, "once published, a further delivery is a duplicate again")
+}
+
+func TestIngestPublishFailureDoesNotReleaseAnotherDeliverysMark(t *testing.T) {
+	// A duplicate never reaches Publish; a deduper error marks nothing. Only the
+	// delivery that set the mark may clear it.
+	pub := &capturePub{err: errors.New("bus down")}
+	released := 0
+	h := NewIngestHandler(pub, baseCfg()).
+		WithDeduper(func(context.Context, string) (bool, error) { return false, errors.New("kv down") }).
+		WithDedupeRelease(func(context.Context, string) error { released++; return nil })
+	body := `{"guid":"evt-2","event_type":"x"}`
+	assert.Equal(t, fiber.StatusInternalServerError, do(t, h, sign([]byte(body), "secret"), body).Code)
+	assert.Equal(t, 0, released, "a fail-open dedupe set no mark, so there is nothing to release")
+}
